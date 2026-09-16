@@ -53,6 +53,11 @@ const model=genAI.getGenerativeModel({
 });
 
 
+// Gemini cooldown
+
+let geminiCooldownUntil=0;
+
+
 // ===============================
 // MONGODB
 // ===============================
@@ -65,13 +70,9 @@ const processedEmailSchema=new mongoose.Schema({
         unique:true
     },
 
-    subject:{
-        type:String
-    },
+    subject:String,
 
-    from:{
-        type:String
-    },
+    from:String,
 
     processedAt:{
         type:Date,
@@ -100,6 +101,7 @@ const oauth2Client=new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
 
     process.env.GOOGLE_CLIENT_SECRET
+
 );
 
 oauth2Client.setCredentials({
@@ -108,6 +110,7 @@ oauth2Client.setCredentials({
         process.env.GOOGLE_REFRESH_TOKEN
 
 });
+
 
 const gmail=google.gmail({
 
@@ -119,7 +122,7 @@ const gmail=google.gmail({
 
 
 // ===============================
-// EXTRACT EMAIL BODY
+// BASE64 DECODER
 // ===============================
 
 function decodeBase64(data){
@@ -134,8 +137,13 @@ function decodeBase64(data){
             "base64"
         )
         .toString("utf-8");
+
 }
 
+
+// ===============================
+// EXTRACT EMAIL BODY
+// ===============================
 
 function extractBody(payload){
 
@@ -143,8 +151,6 @@ function extractBody(payload){
         return "";
     }
 
-
-    // Plain text body
 
     if(
         payload.mimeType==="text/plain" &&
@@ -155,10 +161,9 @@ function extractBody(payload){
         return decodeBase64(
             payload.body.data
         );
+
     }
 
-
-    // Search inside parts
 
     if(payload.parts){
 
@@ -176,11 +181,12 @@ function extractBody(payload){
 
 
     return "";
+
 }
 
 
 // ===============================
-// GET HEADER
+// GET EMAIL HEADER
 // ===============================
 
 function getHeader(headers,name){
@@ -190,20 +196,49 @@ function getHeader(headers,name){
     }
 
     const header=headers.find(
-        h=>h.name.toLowerCase()===name.toLowerCase()
+
+        h=>
+            h.name.toLowerCase()===
+            name.toLowerCase()
+
     );
 
-    return header ? header.value : "";
+    return header
+        ? header.value
+        : "";
+
 }
 
 
 // ===============================
-// ANALYZE EMAIL WITH GEMINI
+// GEMINI ANALYSIS
 // ===============================
 
 async function analyzeEmail(email){
 
-    console.log("🤖 Sending email to Gemini...");
+    // Check Gemini cooldown
+
+    if(Date.now()<geminiCooldownUntil){
+
+        const remaining=Math.ceil(
+
+            (
+                geminiCooldownUntil-
+                Date.now()
+            )/1000
+
+        );
+
+        throw new Error(
+            `Gemini quota cooldown active. Retry in ${remaining}s.`
+        );
+
+    }
+
+
+    console.log(
+        "🤖 Sending email to Gemini..."
+    );
 
 
     const prompt=`
@@ -253,8 +288,6 @@ Priority must be one of:
 "medium"
 "low"
 
-Category should describe the email.
-
 Do not include markdown.
 
 Email:
@@ -264,30 +297,88 @@ ${email}
 `;
 
 
-    const result=await model.generateContent(prompt);
+    try{
 
-    let response=result.response.text().trim();
-
-
-    // Remove markdown code fences if Gemini adds them
-
-    response=response.replace(
-        /^```json\s*/,
-        ""
-    );
-
-    response=response.replace(
-        /^```\s*/,
-        ""
-    );
-
-    response=response.replace(
-        /\s*```$/,
-        ""
-    );
+        const result=
+            await model.generateContent(
+                prompt
+            );
 
 
-    return JSON.parse(response);
+        let response=
+            result.response.text().trim();
+
+
+        response=response.replace(
+            /^```json\s*/,
+            ""
+        );
+
+        response=response.replace(
+            /^```\s*/,
+            ""
+        );
+
+        response=response.replace(
+            /\s*```$/,
+            ""
+        );
+
+
+        return JSON.parse(response);
+
+    }catch(error){
+
+        // Gemini quota error
+
+        if(
+            error.message.includes("429") ||
+            error.message.includes("quota") ||
+            error.message.includes("Too Many Requests")
+        ){
+
+            console.error(
+                "🚫 Gemini quota exceeded."
+            );
+
+
+            // Default 60 second cooldown
+
+            let cooldown=60000;
+
+
+            // Try to extract Google's retry time
+
+            const match=
+                error.message.match(
+                    /retryDelay[":\s]+["']?(\d+)s/
+                );
+
+
+            if(match){
+
+                cooldown=
+                    (Number(match[1])+5)*
+                    1000;
+
+            }
+
+
+            geminiCooldownUntil=
+                Date.now()+cooldown;
+
+
+            console.log(
+                `⏸️ Gemini paused for ${Math.ceil(cooldown/1000)} seconds.`
+            );
+
+        }
+
+
+        throw error;
+
+    }
+
 }
 
 
@@ -297,7 +388,9 @@ ${email}
 
 async function makeCall(summary){
 
-    console.log("📞 Calling your phone...");
+    console.log(
+        "📞 Calling your phone..."
+    );
 
 
     const response=await fetch(
@@ -342,7 +435,8 @@ async function makeCall(summary){
     );
 
 
-    const data=await response.json();
+    const data=
+        await response.json();
 
 
     if(!response.ok){
@@ -355,11 +449,12 @@ async function makeCall(summary){
 
 
     return data;
+
 }
 
 
 // ===============================
-// PROCESS ONE EMAIL
+// PROCESS EMAIL
 // ===============================
 
 async function processEmail(message){
@@ -367,23 +462,28 @@ async function processEmail(message){
     const messageId=message.id;
 
 
-    // Check MongoDB
+    // ===============================
+    // CHECK MONGODB
+    // ===============================
 
     const alreadyProcessed=
         await ProcessedEmail.findOne({
+
             messageId:messageId
+
         });
 
 
     if(alreadyProcessed){
 
-        console.log(
-            `⏭️ Already processed: ${messageId}`
-        );
-
         return;
+
     }
 
+
+    // ===============================
+    // GET EMAIL
+    // ===============================
 
     const emailData=
         await gmail.users.messages.get({
@@ -447,26 +547,47 @@ ${body}
     );
 
 
-    // ==========================================
-    // IMPORTANT:
-    // SAVE EMAIL BEFORE GEMINI
-    // ==========================================
+    // ===============================
+    // SAVE BEFORE GEMINI
+    // ===============================
 
-    // This prevents duplicate processing if
-    // Gemini fails or quota is exceeded.
+    try{
 
-    await ProcessedEmail.create({
+        await ProcessedEmail.create({
 
-        messageId:messageId,
+            messageId:messageId,
 
-        subject:subject,
+            subject:subject,
 
-        from:from,
+            from:from,
 
-        requiresCall:false
+            requiresCall:false
 
-    });
+        });
 
+    }catch(error){
+
+        // Duplicate key means another
+        // process already saved it
+
+        if(error.code===11000){
+
+            console.log(
+                "⏭️ Email already saved."
+            );
+
+            return;
+
+        }
+
+        throw error;
+
+    }
+
+
+    // ===============================
+    // GEMINI
+    // ===============================
 
     try{
 
@@ -480,16 +601,21 @@ ${body}
             "\n🤖 Gemini Analysis:"
         );
 
+
         console.log(
+
             JSON.stringify(
                 analysis,
                 null,
                 2
             )
+
         );
 
 
-        // Update MongoDB with result
+        // ===============================
+        // UPDATE DATABASE
+        // ===============================
 
         await ProcessedEmail.updateOne(
 
@@ -498,18 +624,22 @@ ${body}
             },
 
             {
+
                 $set:{
+
                     requiresCall:
                         analysis.requires_call===true
+
                 }
+
             }
 
         );
 
 
-        // ==========================================
-        // CALL USER
-        // ==========================================
+        // ===============================
+        // EDESY
+        // ===============================
 
         if(
             analysis.requires_call===true
@@ -534,11 +664,13 @@ ${body}
 
 
                 console.log(
+
                     JSON.stringify(
                         callResult,
                         null,
                         2
                     )
+
                 );
 
             }catch(error){
@@ -587,8 +719,27 @@ async function checkEmails(){
 
     if(checking){
 
+        return;
+
+    }
+
+
+    // Don't even fetch/process emails
+    // while Gemini is in cooldown
+
+    if(Date.now()<geminiCooldownUntil){
+
+        const remaining=Math.ceil(
+
+            (
+                geminiCooldownUntil-
+                Date.now()
+            )/1000
+
+        );
+
         console.log(
-            "⏳ Previous Gmail check still running..."
+            `⏸️ Gemini quota cooldown: ${remaining}s remaining`
         );
 
         return;
@@ -626,9 +777,20 @@ async function checkEmails(){
         }
 
 
-        // Gmail returns newest first
-
         for(const message of messages){
+
+            // Stop immediately if Gemini
+            // hits quota
+
+            if(
+                Date.now()<
+                geminiCooldownUntil
+            ){
+
+                break;
+
+            }
+
 
             await processEmail(
                 message
@@ -668,7 +830,12 @@ app.get("/",(req,res)=>{
         mongodb:
             mongoose.connection.readyState===1
                 ? "connected"
-                : "disconnected"
+                : "disconnected",
+
+        gemini:
+            Date.now()<geminiCooldownUntil
+                ? "cooldown"
+                : "available"
 
     });
 
@@ -721,12 +888,8 @@ async function startServer(){
                 );
 
 
-                // First check immediately
-
                 await checkEmails();
 
-
-                // Check every 30 seconds
 
                 setInterval(
 
