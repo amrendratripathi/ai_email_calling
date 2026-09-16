@@ -1,21 +1,77 @@
 require("dotenv").config();
 
 const express=require("express");
+const mongoose=require("mongoose");
 const {google}=require("googleapis");
 const {GoogleGenerativeAI}=require("@google/generative-ai");
-const fs=require("fs").promises;
-const path=require("path");
 
 const app=express();
-
 app.use(express.json());
 
-const PORT=process.env.PORT || 3000;
+const PORT=process.env.PORT||3000;
 
+// =========================
+// CHECK ENV VARIABLES
+// =========================
 
-/* =========================
-   GEMINI
-========================= */
+const requiredEnv=[
+    "GEMINI_API_KEY",
+    "EDESY_API_KEY",
+    "EDESY_AGENT_ID",
+    "MY_PHONE_NUMBER",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+    "MONGODB_URI"
+];
+
+for(const name of requiredEnv){
+    if(!process.env[name]){
+        console.error(`❌ Missing environment variable: ${name}`);
+        process.exit(1);
+    }
+}
+
+// =========================
+// MONGODB
+// =========================
+
+mongoose.connect(process.env.MONGODB_URI)
+.then(()=>{
+    console.log("🍃 MongoDB connected");
+})
+.catch((error)=>{
+    console.error("❌ MongoDB connection failed:",error.message);
+    process.exit(1);
+});
+
+// =========================
+// EMAIL SCHEMA
+// =========================
+
+const processedEmailSchema=new mongoose.Schema({
+    messageId:{
+        type:String,
+        required:true,
+        unique:true
+    },
+    subject:String,
+    from:String,
+    processedAt:{
+        type:Date,
+        default:Date.now
+    },
+    requiresCall:Boolean
+});
+
+const ProcessedEmail=mongoose.model(
+    "ProcessedEmail",
+    processedEmailSchema
+);
+
+// =========================
+// GEMINI
+// =========================
 
 const genAI=new GoogleGenerativeAI(
     process.env.GEMINI_API_KEY
@@ -25,6 +81,103 @@ const model=genAI.getGenerativeModel({
     model:"gemini-2.5-flash"
 });
 
+// =========================
+// GOOGLE AUTH
+// =========================
+
+const oauth2Client=new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+);
+
+oauth2Client.setCredentials({
+    refresh_token:process.env.GOOGLE_REFRESH_TOKEN
+});
+
+const gmail=google.gmail({
+    version:"v1",
+    auth:oauth2Client
+});
+
+// =========================
+// GET EMAIL BODY
+// =========================
+
+function decodeBase64(data){
+    return Buffer.from(
+        data.replace(/-/g,"+").replace(/_/g,"/"),
+        "base64"
+    ).toString("utf8");
+}
+
+function getBody(payload){
+
+    if(!payload){
+        return "";
+    }
+
+    if(payload.body&&payload.body.data){
+        return decodeBase64(payload.body.data);
+    }
+
+    if(payload.parts){
+
+        for(const part of payload.parts){
+
+            if(
+                part.mimeType==="text/plain" &&
+                part.body &&
+                part.body.data
+            ){
+                return decodeBase64(part.body.data);
+            }
+
+            const result=getBody(part);
+
+            if(result){
+                return result;
+            }
+        }
+    }
+
+    return "";
+}
+
+// =========================
+// GET FULL EMAIL
+// =========================
+
+async function getEmail(messageId){
+
+    const response=await gmail.users.messages.get({
+        userId:"me",
+        id:messageId,
+        format:"full"
+    });
+
+    const payload=response.data.payload;
+
+    const headers=payload.headers||[];
+
+    const subjectHeader=headers.find(
+        h=>h.name.toLowerCase()==="subject"
+    );
+
+    const fromHeader=headers.find(
+        h=>h.name.toLowerCase()==="from"
+    );
+
+    return {
+        id:messageId,
+        subject:subjectHeader?.value||"",
+        from:fromHeader?.value||"",
+        body:getBody(payload)
+    };
+}
+
+// =========================
+// GEMINI ANALYSIS
+// =========================
 
 async function analyzeEmail(email){
 
@@ -57,37 +210,29 @@ Return ONLY valid JSON.
 }
 
 Email:
-${email}
+
+From: ${email.from}
+
+Subject: ${email.subject}
+
+Body:
+${email.body}
 `;
 
-    const result=
-        await model.generateContent(prompt);
+    const result=await model.generateContent(prompt);
 
-    let response=
-        result.response.text().trim();
+    let response=result.response.text().trim();
 
-    response=response.replace(
-        /^```json\s*/,
-        ""
-    );
-
-    response=response.replace(
-        /^```\s*/,
-        ""
-    );
-
-    response=response.replace(
-        /\s*```$/,
-        ""
-    );
+    response=response.replace(/^```json\s*/,"");
+    response=response.replace(/^```\s*/,"");
+    response=response.replace(/\s*```$/,"");
 
     return JSON.parse(response);
 }
 
-
-/* =========================
-   EDESY
-========================= */
+// =========================
+// EDESY CALL
+// =========================
 
 async function makeCall(summary){
 
@@ -95,23 +240,14 @@ async function makeCall(summary){
         "https://voice-agent.edesy.in/api/v1/calls",
         {
             method:"POST",
-
             headers:{
                 "Content-Type":"application/json",
                 "Authorization":
                     `Bearer ${process.env.EDESY_API_KEY}`
             },
-
             body:JSON.stringify({
-
-                agentId:
-                    Number(
-                        process.env.EDESY_AGENT_ID
-                    ),
-
-                phoneNumber:
-                    process.env.MY_PHONE_NUMBER,
-
+                agentId:Number(process.env.EDESY_AGENT_ID),
+                phoneNumber:process.env.MY_PHONE_NUMBER,
                 variables:{
                     email_summary:summary
                 }
@@ -119,369 +255,139 @@ async function makeCall(summary){
         }
     );
 
-    const data=
-        await response.json();
+    const data=await response.json();
 
     if(!response.ok){
-
-        throw new Error(
-            JSON.stringify(data)
-        );
+        throw new Error(JSON.stringify(data));
     }
 
     return data;
 }
 
+// =========================
+// PROCESS EMAIL
+// =========================
 
-/* =========================
-   GMAIL AUTHENTICATION
-========================= */
+async function processEmail(email){
 
-const oauth2Client=
-    new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET
-    );
+    console.log("🤖 Sending email to Gemini...");
 
+    const analysis=await analyzeEmail(email);
 
-oauth2Client.setCredentials({
-    refresh_token:
-        process.env.GOOGLE_REFRESH_TOKEN
-});
+    console.log("🤖 Gemini Analysis:");
+    console.log(analysis);
 
+    if(analysis.requires_call===true){
 
-const gmail=google.gmail({
-    version:"v1",
-    auth:oauth2Client
-});
+        console.log("📞 Important email detected!");
+        console.log("Calling your phone...");
 
-
-/* =========================
-   PROCESSED EMAILS
-========================= */
-
-const PROCESSED_FILE=
-    path.join(
-        process.cwd(),
-        "processedEmails.json"
-    );
-
-
-async function getProcessedEmails(){
-
-    try{
-
-        const content=
-            await fs.readFile(
-                PROCESSED_FILE,
-                "utf-8"
-            );
-
-        return JSON.parse(content);
-
-    }catch(error){
-
-        return [];
-    }
-}
-
-
-async function saveProcessedEmail(id){
-
-    const emails=
-        await getProcessedEmails();
-
-    if(!emails.includes(id)){
-
-        emails.push(id);
-
-        await fs.writeFile(
-            PROCESSED_FILE,
-            JSON.stringify(
-                emails,
-                null,
-                2
-            )
+        const callResult=await makeCall(
+            analysis.summary
         );
-    }
-}
 
+        console.log("✅ Edesy call initiated");
 
-/* =========================
-   EMAIL BODY
-========================= */
+        console.log(callResult);
 
-function decodeBody(data){
-
-    return Buffer.from(
-        data,
-        "base64url"
-    ).toString("utf-8");
-}
-
-
-function getEmailBody(payload){
-
-    if(
-        payload.body &&
-        payload.body.data
-    ){
-
-        return decodeBody(
-            payload.body.data
-        );
+        return analysis;
     }
 
+    console.log("ℹ️ Email is not important. No call.");
 
-    if(payload.parts){
-
-        for(const part of payload.parts){
-
-            if(
-                part.mimeType==="text/plain" &&
-                part.body &&
-                part.body.data
-            ){
-
-                return decodeBody(
-                    part.body.data
-                );
-            }
-
-
-            if(part.parts){
-
-                const body=
-                    getEmailBody(part);
-
-                if(body){
-
-                    return body;
-                }
-            }
-        }
-    }
-
-    return "";
+    return analysis;
 }
 
-
-/* =========================
-   PROCESS EMAIL
-========================= */
-
-async function processEmail(messageId){
-
-    const email=
-        await gmail.users.messages.get({
-
-            userId:"me",
-
-            id:messageId,
-
-            format:"full"
-        });
-
-
-    const headers=
-        email.data.payload.headers;
-
-
-    const subject=
-        headers.find(
-            h=>
-            h.name.toLowerCase()==="subject"
-        );
-
-
-    const from=
-        headers.find(
-            h=>
-            h.name.toLowerCase()==="from"
-        );
-
-
-    const body=
-        getEmailBody(
-            email.data.payload
-        );
-
-
-    console.log("\n📧 New Email");
-
-    console.log(
-        "From:",
-        from?.value
-    );
-
-    console.log(
-        "Subject:",
-        subject?.value
-    );
-
-
-    const emailText=`
-Subject: ${subject?.value || ""}
-
-${body}
-`;
-
-
-    console.log(
-        "\n🤖 Sending email to Gemini..."
-    );
-
-
-    const analysis=
-        await analyzeEmail(
-            emailText
-        );
-
-
-    console.log(
-        "\n🤖 Gemini Analysis:"
-    );
-
-    console.log(
-        JSON.stringify(
-            analysis,
-            null,
-            2
-        )
-    );
-
-
-    if(
-        analysis.requires_call===true
-    ){
-
-        console.log(
-            "\n📞 Important email detected!"
-        );
-
-        console.log(
-            "Calling your phone..."
-        );
-
-
-        try{
-
-            const callResult=
-                await makeCall(
-                    analysis.summary
-                );
-
-
-            console.log(
-                "✅ Edesy call initiated"
-            );
-
-            console.log(
-                callResult
-            );
-
-        }catch(error){
-
-            console.error(
-                "❌ Edesy call failed:",
-                error.message
-            );
-
-            throw error;
-        }
-
-    }else{
-
-        console.log(
-            "\nℹ️ Email is not important. No call."
-        );
-    }
-}
-
-
-/* =========================
-   CHECK GMAIL
-========================= */
+// =========================
+// CHECK GMAIL
+// =========================
 
 let checking=false;
-
 
 async function checkEmails(){
 
     if(checking){
-
-        console.log(
-            "⏳ Previous Gmail check still running..."
-        );
-
         return;
     }
 
-
     checking=true;
-
 
     try{
 
-        const processedEmails=
-            await getProcessedEmails();
+        const response=await gmail.users.messages.list({
+            userId:"me",
+            maxResults:10
+        });
 
-
-        const result=
-            await gmail.users.messages.list({
-
-                userId:"me",
-
-                maxResults:10
-
-            });
-
-
-        const messages=
-            result.data.messages;
-
-
-        if(
-            !messages ||
-            messages.length===0
-        ){
-
-            console.log(
-                "📭 No emails found."
-            );
-
-            return;
-        }
-
+        const messages=response.data.messages||[];
 
         for(const message of messages){
 
-            if(
-                processedEmails.includes(
-                    message.id
-                )
-            ){
+            const messageId=message.id;
+
+            // =========================
+            // CHECK MONGODB
+            // =========================
+
+            const alreadyProcessed=
+                await ProcessedEmail.findOne({
+                    messageId
+                });
+
+            if(alreadyProcessed){
+
+                console.log(
+                    `⏭️ Already processed: ${messageId}`
+                );
 
                 continue;
             }
 
+            // =========================
+            // GET EMAIL
+            // =========================
+
+            const email=await getEmail(messageId);
+
+            console.log("\n📧 New Email");
+            console.log(`From: ${email.from}`);
+            console.log(`Subject: ${email.subject}`);
+
+            // =========================
+            // IMPORTANT:
+            // SAVE BEFORE GEMINI
+            // =========================
+
+            const record=
+                await ProcessedEmail.create({
+                    messageId,
+                    subject:email.subject,
+                    from:email.from,
+                    requiresCall:null
+                });
+
+            console.log(
+                "💾 Email ID saved to MongoDB"
+            );
+
+            // =========================
+            // GEMINI + EDESY
+            // =========================
 
             try{
 
-                await processEmail(
-                    message.id
+                const analysis=
+                    await processEmail(email);
+
+                await ProcessedEmail.updateOne(
+                    {_id:record._id},
+                    {
+                        requiresCall:
+                            analysis.requires_call
+                    }
                 );
 
-
-                await saveProcessedEmail(
-                    message.id
-                );
-
-
-                console.log(
-                    "✅ Email processed."
-                );
-
+                console.log("✅ Email processed.");
 
             }catch(error){
 
@@ -491,7 +397,7 @@ async function checkEmails(){
                 );
 
                 console.log(
-                    "⚠️ Email will be retried."
+                    "⚠️ Email will NOT be processed again."
                 );
             }
         }
@@ -509,15 +415,31 @@ async function checkEmails(){
     }
 }
 
+// =========================
+// HEALTH ROUTE
+// =========================
 
-/* =========================
-   START GMAIL MONITORING
-========================= */
+app.get("/",(req,res)=>{
 
-async function startMonitoring(){
+    res.json({
+        status:"running",
+        service:"AI Email Caller"
+    });
+
+});
+
+// =========================
+// START SERVER
+// =========================
+
+app.listen(PORT,async()=>{
 
     console.log(
-        "\n🚀 AI Email Caller started!"
+        `🌐 Server running on port ${PORT}`
+    );
+
+    console.log(
+        "🚀 AI Email Caller started!"
     );
 
     console.log(
@@ -528,59 +450,10 @@ async function startMonitoring(){
         "👀 Monitoring Gmail..."
     );
 
-
-    // Check immediately
-
     await checkEmails();
 
-
-    // Check every 30 seconds
-
     setInterval(
-        async()=>{
-
-            console.log(
-                "\n🔍 Checking for new emails..."
-            );
-
-            await checkEmails();
-
-        },
-        30*1000
+        checkEmails,
+        30000
     );
-}
-
-
-/* =========================
-   HEALTH CHECK
-========================= */
-
-app.get(
-    "/",
-    (req,res)=>{
-
-        res.json({
-            status:"running",
-            service:"AI Email Caller"
-        });
-
-    }
-);
-
-
-/* =========================
-   START SERVER
-========================= */
-
-app.listen(
-    PORT,
-    ()=>{
-
-        console.log(
-            `🌐 Server running on port ${PORT}`
-        );
-
-        startMonitoring();
-
-    }
-);
+});
