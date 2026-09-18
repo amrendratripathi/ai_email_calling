@@ -1,8 +1,6 @@
 const mongoose=require("mongoose");
 
-
 const callAttemptSchema=new mongoose.Schema({
-
     attemptNumber:{
         type:Number,
         required:true
@@ -25,7 +23,6 @@ const callAttemptSchema=new mongoose.Schema({
 
     status:{
         type:String,
-
         enum:[
             "initiated",
             "ringing",
@@ -33,7 +30,6 @@ const callAttemptSchema=new mongoose.Schema({
             "not_received",
             "failed"
         ],
-
         default:"initiated"
     },
 
@@ -56,9 +52,7 @@ const callAttemptSchema=new mongoose.Schema({
         type:String,
         default:null
     }
-
 });
-
 
 const emailSchema=new mongoose.Schema({
 
@@ -100,7 +94,6 @@ const emailSchema=new mongoose.Schema({
         index:true
     },
 
-
     aiAnalysis:{
 
         important:{
@@ -110,13 +103,11 @@ const emailSchema=new mongoose.Schema({
 
         priority:{
             type:String,
-
             enum:[
                 "low",
                 "medium",
                 "high"
             ],
-
             default:"low"
         },
 
@@ -139,43 +130,40 @@ const emailSchema=new mongoose.Schema({
             type:Date,
             default:null
         }
-
     },
-
 
     callAttempts:{
         type:[callAttemptSchema],
         default:[]
     },
 
-
     processingStatus:{
         type:String,
-
         enum:[
             "pending",
             "processing",
             "completed",
             "failed"
         ],
-
         default:"pending",
-
         index:true
     },
-
 
     attempts:{
         type:Number,
         default:0
     },
 
-
     lastError:{
         type:String,
         default:null
     },
 
+    nextRetryAt:{
+        type:Date,
+        default:null,
+        index:true
+    },
 
     processedAt:{
         type:Date,
@@ -186,9 +174,7 @@ const emailSchema=new mongoose.Schema({
     timestamps:true
 });
 
-
-module.exports=
-    mongoose.model(
-        "Email",
-        emailSchema
-    );
+module.exports=mongoose.model(
+    "Email",
+    emailSchema
+);
