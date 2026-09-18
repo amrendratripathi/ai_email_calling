@@ -1,20 +1,31 @@
 require("dotenv").config();
 
 const express=require("express");
+const cors=require("cors");
 const mongoose=require("mongoose");
 const {google}=require("googleapis");
 const {GoogleGenerativeAI}=require("@google/generative-ai");
 
-const app=express();
+const Email=require("./models/Email");
 
-app.use(express.json());
+
+const app=express();
 
 const PORT=process.env.PORT||3000;
 
 
-// ===============================
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+
+app.use(cors());
+
+app.use(express.json());
+
+
+// ============================================================
 // ENVIRONMENT VARIABLES
-// ===============================
+// ============================================================
 
 const requiredEnv=[
     "GEMINI_API_KEY",
@@ -26,6 +37,7 @@ const requiredEnv=[
     "GOOGLE_REFRESH_TOKEN",
     "MONGODB_URI"
 ];
+
 
 for(const variable of requiredEnv){
 
@@ -40,9 +52,9 @@ for(const variable of requiredEnv){
 }
 
 
-// ===============================
+// ============================================================
 // GEMINI
-// ===============================
+// ============================================================
 
 const genAI=new GoogleGenerativeAI(
     process.env.GEMINI_API_KEY
@@ -53,56 +65,40 @@ const model=genAI.getGenerativeModel({
 });
 
 
-// Gemini cooldown
-
 let geminiCooldownUntil=0;
 
 
-// ===============================
+// ============================================================
 // MONGODB
-// ===============================
+// ============================================================
 
-const processedEmailSchema=new mongoose.Schema({
+async function connectMongoDB(){
 
-    messageId:{
-        type:String,
-        required:true,
-        unique:true
-    },
+    console.log(
+        "🔌 Connecting to MongoDB..."
+    );
 
-    subject:String,
+    await mongoose.connect(
+        process.env.MONGODB_URI
+    );
 
-    from:String,
-
-    processedAt:{
-        type:Date,
-        default:Date.now
-    },
-
-    requiresCall:{
-        type:Boolean,
-        default:false
-    }
-
-});
-
-const ProcessedEmail=mongoose.model(
-    "ProcessedEmail",
-    processedEmailSchema
-);
+    console.log(
+        "🍃 MongoDB connected"
+    );
+}
 
 
-// ===============================
+// ============================================================
 // GOOGLE OAUTH
-// ===============================
+// ============================================================
 
 const oauth2Client=new google.auth.OAuth2(
 
     process.env.GOOGLE_CLIENT_ID,
 
     process.env.GOOGLE_CLIENT_SECRET
-
 );
+
 
 oauth2Client.setCredentials({
 
@@ -121,9 +117,9 @@ const gmail=google.gmail({
 });
 
 
-// ===============================
-// BASE64 DECODER
-// ===============================
+// ============================================================
+// HELPERS
+// ============================================================
 
 function decodeBase64(data){
 
@@ -133,17 +129,14 @@ function decodeBase64(data){
 
     return Buffer
         .from(
-            data.replace(/-/g,"+").replace(/_/g,"/"),
+            data
+                .replace(/-/g,"+")
+                .replace(/_/g,"/"),
             "base64"
         )
         .toString("utf-8");
-
 }
 
-
-// ===============================
-// EXTRACT EMAIL BODY
-// ===============================
 
 function extractBody(payload){
 
@@ -161,7 +154,6 @@ function extractBody(payload){
         return decodeBase64(
             payload.body.data
         );
-
     }
 
 
@@ -169,31 +161,37 @@ function extractBody(payload){
 
         for(const part of payload.parts){
 
-            const body=extractBody(part);
+            const body=
+                extractBody(part);
 
             if(body){
                 return body;
             }
-
         }
+    }
 
+
+    if(
+        payload.body &&
+        payload.body.data
+    ){
+
+        return decodeBase64(
+            payload.body.data
+        );
     }
 
 
     return "";
-
 }
 
-
-// ===============================
-// GET EMAIL HEADER
-// ===============================
 
 function getHeader(headers,name){
 
     if(!headers){
         return "";
     }
+
 
     const header=headers.find(
 
@@ -203,20 +201,18 @@ function getHeader(headers,name){
 
     );
 
+
     return header
         ? header.value
         : "";
-
 }
 
 
-// ===============================
+// ============================================================
 // GEMINI ANALYSIS
-// ===============================
+// ============================================================
 
 async function analyzeEmail(email){
-
-    // Check Gemini cooldown
 
     if(Date.now()<geminiCooldownUntil){
 
@@ -229,10 +225,10 @@ async function analyzeEmail(email){
 
         );
 
+
         throw new Error(
             `Gemini quota cooldown active. Retry in ${remaining}s.`
         );
-
     }
 
 
@@ -306,7 +302,9 @@ ${email}
 
 
         let response=
-            result.response.text().trim();
+            result.response
+                .text()
+                .trim();
 
 
         response=response.replace(
@@ -314,10 +312,12 @@ ${email}
             ""
         );
 
+
         response=response.replace(
             /^```\s*/,
             ""
         );
+
 
         response=response.replace(
             /\s*```$/,
@@ -325,11 +325,12 @@ ${email}
         );
 
 
-        return JSON.parse(response);
+        return JSON.parse(
+            response
+        );
+
 
     }catch(error){
-
-        // Gemini quota error
 
         if(
             error.message.includes("429") ||
@@ -342,12 +343,8 @@ ${email}
             );
 
 
-            // Default 60 second cooldown
-
             let cooldown=60000;
 
-
-            // Try to extract Google's retry time
 
             const match=
                 error.message.match(
@@ -360,31 +357,28 @@ ${email}
                 cooldown=
                     (Number(match[1])+5)*
                     1000;
-
             }
 
 
             geminiCooldownUntil=
-                Date.now()+cooldown;
+                Date.now()+
+                cooldown;
 
 
             console.log(
                 `⏸️ Gemini paused for ${Math.ceil(cooldown/1000)} seconds.`
             );
-
         }
 
 
         throw error;
-
     }
-
 }
 
 
-// ===============================
+// ============================================================
 // EDESY CALL
-// ===============================
+// ============================================================
 
 async function makeCall(summary){
 
@@ -444,46 +438,41 @@ async function makeCall(summary){
         throw new Error(
             JSON.stringify(data)
         );
-
     }
 
 
     return data;
-
 }
 
 
-// ===============================
+// ============================================================
 // PROCESS EMAIL
-// ===============================
+// ============================================================
 
 async function processEmail(message){
 
     const messageId=message.id;
 
 
-    // ===============================
-    // CHECK MONGODB
-    // ===============================
+    // --------------------------------------------------------
+    // CHECK IF EMAIL ALREADY EXISTS
+    // --------------------------------------------------------
 
-    const alreadyProcessed=
-        await ProcessedEmail.findOne({
-
-            messageId:messageId
-
+    const existing=
+        await Email.findOne({
+            messageId
         });
 
 
-    if(alreadyProcessed){
+    if(existing){
 
         return;
-
     }
 
 
-    // ===============================
-    // GET EMAIL
-    // ===============================
+    // --------------------------------------------------------
+    // GET FULL GMAIL MESSAGE
+    // --------------------------------------------------------
 
     const emailData=
         await gmail.users.messages.get({
@@ -512,6 +501,13 @@ async function processEmail(message){
         );
 
 
+    const to=
+        getHeader(
+            headers,
+            "To"
+        );
+
+
     const subject=
         getHeader(
             headers,
@@ -519,75 +515,110 @@ async function processEmail(message){
         );
 
 
+    const dateHeader=
+        getHeader(
+            headers,
+            "Date"
+        );
+
+
     const body=
-        extractBody(payload);
+        extractBody(
+            payload
+        );
+
+
+    const receivedAt=
+        dateHeader
+            ? new Date(dateHeader)
+            : new Date();
 
 
     const emailText=`
 
 From: ${from}
 
+To: ${to}
+
 Subject: ${subject}
 
-Body:
+Email:
 
 ${body}
 
 `;
 
 
-    console.log("\n📧 New Email");
+    console.log(
+        "\n📧 New Email"
+    );
+
 
     console.log(
         `From: ${from}`
     );
+
 
     console.log(
         `Subject: ${subject}`
     );
 
 
-    // ===============================
-    // SAVE BEFORE GEMINI
-    // ===============================
+    // --------------------------------------------------------
+    // CREATE DATABASE RECORD
+    // --------------------------------------------------------
+
+    let emailRecord;
+
 
     try{
 
-        await ProcessedEmail.create({
+        emailRecord=
+            await Email.create({
 
-            messageId:messageId,
+                messageId,
 
-            subject:subject,
+                threadId:
+                    emailData.data.threadId||
+                    null,
 
-            from:from,
+                from,
 
-            requiresCall:false
+                to,
 
-        });
+                subject,
+
+                body,
+
+                receivedAt,
+
+                processingStatus:
+                    "processing",
+
+                attempts:1
+
+            });
+
 
     }catch(error){
-
-        // Duplicate key means another
-        // process already saved it
 
         if(error.code===11000){
 
             console.log(
-                "⏭️ Email already saved."
+                "⏭️ Email already exists."
             );
 
             return;
-
         }
 
-        throw error;
 
+        throw error;
     }
 
 
-    // ===============================
+    // --------------------------------------------------------
     // GEMINI
-    // ===============================
+    // --------------------------------------------------------
 
     try{
 
@@ -603,43 +634,43 @@ ${body}
 
 
         console.log(
-
             JSON.stringify(
                 analysis,
                 null,
                 2
             )
-
         );
 
 
-        // ===============================
-        // UPDATE DATABASE
-        // ===============================
+        emailRecord.aiAnalysis={
 
-        await ProcessedEmail.updateOne(
+            important:
+                analysis.important===true,
 
-            {
-                messageId:messageId
-            },
+            priority:
+                analysis.priority||
+                "low",
 
-            {
+            category:
+                analysis.category||
+                "general",
 
-                $set:{
+            summary:
+                analysis.summary||
+                "",
 
-                    requiresCall:
-                        analysis.requires_call===true
+            requiresCall:
+                analysis.requires_call===true,
 
-                }
+            analyzedAt:
+                new Date()
 
-            }
-
-        );
+        };
 
 
-        // ===============================
+        // ----------------------------------------------------
         // EDESY
-        // ===============================
+        // ----------------------------------------------------
 
         if(
             analysis.requires_call===true
@@ -658,20 +689,45 @@ ${body}
                     );
 
 
+                const callData=
+                    callResult?.data||
+                    callResult;
+
+
+                emailRecord.callAttempts.push({
+
+                    attemptNumber:1,
+
+                    edesyConversationId:
+                        callData?.conversationId||
+                        null,
+
+                    edesyCallSid:
+                        callData?.callSid||
+                        null,
+
+                    initiatedAt:
+                        new Date(),
+
+                    status:
+                        "initiated"
+
+                });
+
+
                 console.log(
                     "✅ Edesy call initiated"
                 );
 
 
                 console.log(
-
                     JSON.stringify(
                         callResult,
                         null,
                         2
                     )
-
                 );
+
 
             }catch(error){
 
@@ -680,15 +736,41 @@ ${body}
                     error.message
                 );
 
+
+                emailRecord.callAttempts.push({
+
+                    attemptNumber:1,
+
+                    initiatedAt:
+                        new Date(),
+
+                    status:
+                        "failed",
+
+                    failureReason:
+                        error.message
+
+                });
             }
+
 
         }else{
 
             console.log(
                 "ℹ️ Email is not important. No call."
             );
-
         }
+
+
+        emailRecord.processingStatus=
+            "completed";
+
+
+        emailRecord.processedAt=
+            new Date();
+
+
+        await emailRecord.save();
 
 
         console.log(
@@ -703,14 +785,23 @@ ${body}
             error.message
         );
 
-    }
 
+        emailRecord.processingStatus=
+            "failed";
+
+
+        emailRecord.lastError=
+            error.message;
+
+
+        await emailRecord.save();
+    }
 }
 
 
-// ===============================
-// CHECK GMAIL
-// ===============================
+// ============================================================
+// GMAIL MONITOR
+// ============================================================
 
 let checking=false;
 
@@ -718,14 +809,9 @@ let checking=false;
 async function checkEmails(){
 
     if(checking){
-
         return;
-
     }
 
-
-    // Don't even fetch/process emails
-    // while Gemini is in cooldown
 
     if(Date.now()<geminiCooldownUntil){
 
@@ -738,12 +824,13 @@ async function checkEmails(){
 
         );
 
+
         console.log(
             `⏸️ Gemini quota cooldown: ${remaining}s remaining`
         );
 
-        return;
 
+        return;
     }
 
 
@@ -763,7 +850,8 @@ async function checkEmails(){
 
 
         const messages=
-            response.data.messages||[];
+            response.data.messages||
+            [];
 
 
         if(messages.length===0){
@@ -773,14 +861,10 @@ async function checkEmails(){
             );
 
             return;
-
         }
 
 
         for(const message of messages){
-
-            // Stop immediately if Gemini
-            // hits quota
 
             if(
                 Date.now()<
@@ -788,14 +872,12 @@ async function checkEmails(){
             ){
 
                 break;
-
             }
 
 
             await processEmail(
                 message
             );
-
         }
 
 
@@ -806,18 +888,20 @@ async function checkEmails(){
             error.message
         );
 
+
     }finally{
 
         checking=false;
-
     }
-
 }
 
 
-// ===============================
-// HEALTH CHECK
-// ===============================
+// ============================================================
+// FRONTEND API
+// ============================================================
+
+
+// Health
 
 app.get("/",(req,res)=>{
 
@@ -825,7 +909,8 @@ app.get("/",(req,res)=>{
 
         status:"running",
 
-        service:"AI Email Caller",
+        service:
+            "REWA AI Email Caller",
 
         mongodb:
             mongoose.connection.readyState===1
@@ -838,31 +923,420 @@ app.get("/",(req,res)=>{
                 : "available"
 
     });
-
 });
 
 
-// ===============================
+// ============================================================
+// ALL EMAILS
+// ============================================================
+
+app.get(
+    "/api/emails",
+    async(req,res)=>{
+
+        try{
+
+            const emails=
+                await Email.find()
+                    .sort({
+                        receivedAt:-1
+                    })
+                    .lean();
+
+
+            res.json(emails);
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch emails"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
+// IMPORTANT EMAILS
+// ============================================================
+
+app.get(
+    "/api/emails/important",
+    async(req,res)=>{
+
+        try{
+
+            const emails=
+                await Email.find({
+
+                    "aiAnalysis.important":
+                        true
+
+                })
+                .sort({
+                    receivedAt:-1
+                })
+                .lean();
+
+
+            res.json(emails);
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch important emails"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
+// SINGLE EMAIL
+// ============================================================
+
+app.get(
+    "/api/emails/:id",
+    async(req,res)=>{
+
+        try{
+
+            const email=
+                await Email.findById(
+                    req.params.id
+                ).lean();
+
+
+            if(!email){
+
+                return res.status(404).json({
+
+                    error:
+                        "Email not found"
+
+                });
+            }
+
+
+            res.json(email);
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch email"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
+// CALLS
+// ============================================================
+
+app.get(
+    "/api/calls",
+    async(req,res)=>{
+
+        try{
+
+            const emails=
+                await Email.find({
+
+                    "aiAnalysis.requiresCall":
+                        true
+
+                })
+                .sort({
+                    receivedAt:-1
+                })
+                .lean();
+
+
+            res.json(emails);
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch calls"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
+// STATS
+// ============================================================
+
+app.get(
+    "/api/stats",
+    async(req,res)=>{
+
+        try{
+
+            const totalEmails=
+                await Email.countDocuments();
+
+
+            const importantEmails=
+                await Email.countDocuments({
+
+                    "aiAnalysis.important":
+                        true
+
+                });
+
+
+            const callsRequired=
+                await Email.countDocuments({
+
+                    "aiAnalysis.requiresCall":
+                        true
+
+                });
+
+
+            const callsReceived=
+                await Email.countDocuments({
+
+                    "callAttempts":{
+                        $elemMatch:{
+                            status:
+                                "received"
+                        }
+                    }
+
+                });
+
+
+            const callsNotReceived=
+                await Email.countDocuments({
+
+                    "aiAnalysis.requiresCall":
+                        true,
+
+                    "callAttempts":{
+                        $not:{
+                            $elemMatch:{
+                                status:
+                                    "received"
+                            }
+                        }
+                    }
+
+                });
+
+
+            res.json({
+
+                totalEmails,
+
+                importantEmails,
+
+                callsRequired,
+
+                callsReceived,
+
+                callsNotReceived
+
+            });
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch statistics"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
+// TIMELINE
+// ============================================================
+
+app.get(
+    "/api/timeline",
+    async(req,res)=>{
+
+        try{
+
+            const emails=
+                await Email.find()
+                    .sort({
+                        receivedAt:-1
+                    })
+                    .lean();
+
+
+            const timeline=[];
+
+
+            for(const email of emails){
+
+                timeline.push({
+
+                    id:
+                        `${email._id}-email`,
+
+                    emailId:
+                        email._id,
+
+                    type:
+                        "email_received",
+
+                    title:
+                        "Email Received",
+
+                    description:
+                        email.subject,
+
+                    timestamp:
+                        email.receivedAt
+
+                });
+
+
+                if(
+                    email.aiAnalysis &&
+                    email.aiAnalysis.analyzedAt
+                ){
+
+                    timeline.push({
+
+                        id:
+                            `${email._id}-ai`,
+
+                        emailId:
+                            email._id,
+
+                        type:
+                            "ai_analysis",
+
+                        title:
+                            "AI Analysis",
+
+                        description:
+                            email.aiAnalysis.summary,
+
+                        timestamp:
+                            email.aiAnalysis.analyzedAt
+
+                    });
+                }
+
+
+                for(
+                    const call
+                    of email.callAttempts||[]
+                ){
+
+                    timeline.push({
+
+                        id:
+                            `${email._id}-${call._id}`,
+
+                        emailId:
+                            email._id,
+
+                        type:
+                            "call",
+
+                        title:
+                            "Call",
+
+                        description:
+                            call.status,
+
+                        timestamp:
+                            call.initiatedAt,
+
+                        status:
+                            call.status,
+
+                        duration:
+                            call.duration||0
+
+                    });
+                }
+            }
+
+
+            timeline.sort(
+
+                (a,b)=>
+                    new Date(b.timestamp)-
+                    new Date(a.timestamp)
+
+            );
+
+
+            res.json(
+                timeline
+            );
+
+
+        }catch(error){
+
+            console.error(error);
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to fetch timeline"
+
+            });
+        }
+    }
+);
+
+
+// ============================================================
 // START SERVER
-// ===============================
+// ============================================================
 
 async function startServer(){
 
     try{
 
-        console.log(
-            "🔌 Connecting to MongoDB..."
-        );
-
-
-        await mongoose.connect(
-            process.env.MONGODB_URI
-        );
-
-
-        console.log(
-            "🍃 MongoDB connected"
-        );
+        await connectMongoDB();
 
 
         app.listen(
@@ -875,13 +1349,16 @@ async function startServer(){
                     `🌐 Server running on port ${PORT}`
                 );
 
+
                 console.log(
-                    "🚀 AI Email Caller started!"
+                    "🚀 REWA AI Email Caller started!"
                 );
+
 
                 console.log(
                     "🔐 Using Google OAuth refresh token..."
                 );
+
 
                 console.log(
                     "👀 Monitoring Gmail..."
@@ -900,22 +1377,22 @@ async function startServer(){
                 );
 
             }
-
         );
 
 
     }catch(error){
 
         console.error(
+
             "❌ MongoDB connection failed:",
+
             error.message
+
         );
 
 
         process.exit(1);
-
     }
-
 }
 
 
